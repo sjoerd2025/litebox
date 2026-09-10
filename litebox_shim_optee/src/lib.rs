@@ -11,7 +11,7 @@ extern crate alloc;
 use crate::loader::elf::ElfLoaderError;
 use crate::syscalls::pta::PseudoTa;
 use aes::{Aes128, Aes192, Aes256};
-use alloc::{sync::Arc, vec};
+use alloc::{boxed::Box, sync::Arc, vec};
 use core::cell::Cell;
 use ctr::Ctr128BE;
 use hashbrown::{HashMap, HashSet};
@@ -152,6 +152,7 @@ pub struct OpteeShimBuilder<Platform: OpteeShimPlatform> {
     platform: &'static Platform,
     session_manager: &'static session::SessionManager<Platform>,
     litebox: LiteBox<Platform>,
+    retained_page_table: Option<Box<dyn Send + Sync>>,
 }
 
 impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
@@ -166,7 +167,27 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             platform,
             session_manager,
             litebox: LiteBox::new(platform),
+            retained_page_table: None,
         }
+    }
+
+    /// Retains the shim's task page table.
+    #[must_use]
+    pub fn retain_page_table<T: Send + Sync + 'static>(mut self, page_table: T) -> Self {
+        self.retained_page_table = Some(Box::new(page_table));
+        self
+    }
+
+    /// Resolves and caches a TA binary.
+    pub fn prepare_ta_bin(&self, ta_uuid: &TeeUuid) -> bool {
+        let binaries = ta_uuid_map();
+        if binaries.get(ta_uuid).is_some() {
+            return true;
+        }
+        let Some(ta_bin) = GlobalState::<Platform>::rpc_get_ta_bin(ta_uuid) else {
+            return false;
+        };
+        binaries.insert(*ta_uuid, ta_bin)
     }
 
     /// Returns the litebox object for the shim.
@@ -184,6 +205,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             _litebox: self.litebox,
             ta_uuid_map: ta_uuid_map(),
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
+            _retained_page_table: self.retained_page_table,
         });
         OpteeShim(global)
     }
@@ -213,6 +235,8 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     /// blocking/queuing the caller until the PTA is free. We currently reject
     /// instead of serialize; revisit if a PTA needs true serialization.
     pta_busy: spin::mutex::SpinMutex<HashSet<PseudoTa>>,
+    /// Declared last so the retained task table drops after the shim state.
+    _retained_page_table: Option<Box<dyn Send + Sync>>,
 }
 
 impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
@@ -367,22 +391,6 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// Get the TA binary associated with the given TA UUID.
     pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.0.get_ta_bin(ta_uuid)
-    }
-
-    /// Release all user-space memory mappings owned by this shim instance.
-    ///
-    /// This must be called before switching to the base page table and deleting
-    /// the task page table so that every mapped physical page is properly freed.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that no references to the released memory regions
-    /// are held after this call.
-    pub unsafe fn release_user_mappings(&self) {
-        let release = |_r: core::ops::Range<usize>, _vm: litebox::mm::linux::VmFlags| true;
-        unsafe {
-            let _ = self.page_manager().release_memory(release);
-        }
     }
 }
 

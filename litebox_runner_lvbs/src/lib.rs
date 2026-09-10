@@ -420,23 +420,16 @@ unsafe fn switch_to_task_page_table(
     }
 }
 
-/// Deletes a task-specific page table.
-///
-/// # Safety
-///
-/// The caller must ensure that no references or pointers to memory mapped
-/// by this page table are held after deletion.
+/// Unregisters a task page table; outstanding handles defer reclamation.
 #[inline]
-unsafe fn delete_task_page_table(
+fn unregister_task_page_table(
     platform: &'static Platform,
     task_pt_id: usize,
 ) -> Result<(), OpteeSmcReturnCode> {
-    // Safety: caller guarantees no dangling references
-    unsafe {
-        platform
-            .delete_task_page_table(task_pt_id)
-            .map_err(|_| OpteeSmcReturnCode::EBadCmd)
-    }
+    // Safety: OP-TEE TAs are single-threaded and use no shared/COW user-page
+    // mappings; session serialization prevents concurrent access.
+    unsafe { platform.unregister_task_page_table(task_pt_id) }
+        .map_err(|_| OpteeSmcReturnCode::EBadCmd)
 }
 
 /// Enforces the invariant that the core must be on the base (kernel) page
@@ -465,29 +458,15 @@ impl Drop for TaskPageTableGuard {
     }
 }
 
-/// Tears down a TA's memory mappings and page table.
+/// Switches to base and unregisters the task table.
 ///
-/// This performs the following steps in order:
-/// 1. Release user-space memory mappings in the TA's page table
-/// 2. Switch to the base page table
-/// 3. Delete the TA's page table
-///
-/// # Safety
-///
-/// The caller must ensure that no references to user-space memory mapped by
-/// this task's page table are held after this call.
-unsafe fn teardown_ta_page_table(
-    platform: &'static Platform,
-    shim: &litebox_shim_optee::OpteeShim<Platform>,
-    task_pt_id: usize,
-) {
-    unsafe {
-        // this function unmaps/deallocates user pages in the **active** page table, so we must
-        // still be on the TA's page table.
-        shim.release_user_mappings();
-        switch_to_base_page_table(platform);
-        // Now delete the TA's page table without memory leak.
-        let _ = delete_task_page_table(platform, task_pt_id);
+/// Session/instance serialization must prevent new activations, and all
+/// user-memory copies must be complete.
+fn teardown_ta_page_table(platform: &'static Platform, task_pt_id: usize) {
+    // Safety: no user-memory references remain; the shim still retains the table.
+    unsafe { switch_to_base_page_table(platform) };
+    if let Err(error) = unregister_task_page_table(platform, task_pt_id) {
+        debug_serial_println!("Failed to unregister task page table {task_pt_id:#x}: {error:?}");
     }
 }
 
@@ -744,11 +723,7 @@ fn open_session_single_instance(
             debug_serial_println!("Single-instance TA panicked during OpenSession, cleaning up");
 
             session_manager().mark_sessions_dead_for_instance(instance);
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
-            unsafe {
-                teardown_ta_page_table(platform, instance.shim(), task_pt_id);
-            };
+            teardown_ta_page_table(platform, task_pt_id);
 
             // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
             // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
@@ -783,11 +758,7 @@ fn open_session_single_instance(
         if !ta_flags.is_keep_alive() && session_manager().count_sessions_for_instance(instance) == 0
         {
             let _ = session_manager().evict_cached_instance(instance);
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
-            unsafe {
-                teardown_ta_page_table(platform, instance.shim(), task_pt_id);
-            };
+            teardown_ta_page_table(platform, task_pt_id);
         } else {
             // The session id is forgotten (never recycled), so the token's drop
             // won't clear the recorded identity. Remove the client identity here.
@@ -823,8 +794,8 @@ fn open_session_new_instance(
     client_identity: Option<litebox_common_optee::TeeIdentity>,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
 ) -> Result<(), OpteeSmcReturnCode> {
-    let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager()).build();
-    if shim.get_ta_bin(&ta_uuid).is_none() {
+    let shim_builder = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager());
+    if !shim_builder.prepare_ta_bin(&ta_uuid) {
         msg_args.session = 0;
         msg_args.ret = TeeResult::ItemNotFound;
         msg_args.ret_origin = TeeOrigin::Tee;
@@ -841,16 +812,33 @@ fn open_session_new_instance(
     let task_pt_id = create_task_page_table(platform)?;
     debug_serial_println!("Created task page table ID: {}", task_pt_id);
 
-    let _task_pt_guard = TaskPageTableGuard::enter(platform, task_pt_id).inspect_err(|_| {
-        // Safety: switch_to_task_page_table failed, so task page table is not active.
-        let _ = unsafe { delete_task_page_table(platform, task_pt_id) };
+    let page_table = platform
+        .page_table_manager()
+        .task_page_table(task_pt_id)
+        .map_err(|_| OpteeSmcReturnCode::EBadCmd)
+        .inspect_err(|error| {
+            debug_serial_println!("Failed to retain task page table: {error:?}");
+            if let Err(remove_error) = unregister_task_page_table(platform, task_pt_id) {
+                debug_serial_println!(
+                    "Failed to unregister task page table {task_pt_id:#x}: {remove_error:?}"
+                );
+            }
+        })?;
+
+    let _task_pt_guard = TaskPageTableGuard::enter(platform, task_pt_id).inspect_err(|error| {
+        debug_serial_println!("Failed to activate task page table: {error:?}");
+        if let Err(remove_error) = unregister_task_page_table(platform, task_pt_id) {
+            debug_serial_println!(
+                "Failed to unregister task page table {task_pt_id:#x}: {remove_error:?}"
+            );
+        }
     })?;
+
+    let shim = shim_builder.retain_page_table(page_table).build();
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
     let loaded_program = Box::new(shim.load_ldelf(LDELF_BINARY, ta_uuid).map_err(|_| {
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
-        unsafe { teardown_ta_page_table(platform, &shim, task_pt_id) };
+        teardown_ta_page_table(platform, task_pt_id);
         OpteeSmcReturnCode::ENomem
     })?);
 
@@ -892,10 +880,7 @@ fn open_session_new_instance(
             Some(ta_req_info),
             None,
         );
-
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
-        unsafe { teardown_ta_page_table(platform, &shim, task_pt_id) };
+        teardown_ta_page_table(platform, task_pt_id);
 
         write_result?;
         return Ok(());
@@ -906,9 +891,7 @@ fn open_session_new_instance(
 
     // Load TA context with parameters for OpenSession - pass actual session_id
     loaded_program.entrypoints.as_ref().ok_or_else(|| {
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
-        unsafe { teardown_ta_page_table(platform, &shim, task_pt_id) };
+        teardown_ta_page_table(platform, task_pt_id);
         OpteeSmcReturnCode::EBadCmd
     })?;
     let memref_addresses = loaded_program
@@ -923,9 +906,7 @@ fn open_session_new_instance(
             None,
         )
         .map_err(|_| {
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
-            unsafe { teardown_ta_page_table(platform, &shim, task_pt_id) };
+            teardown_ta_page_table(platform, task_pt_id);
             OpteeSmcReturnCode::EBadCmd
         })?;
 
@@ -940,17 +921,13 @@ fn open_session_new_instance(
 
     // Read TA output parameters from the stack buffer
     let params_address = loaded_program.params_address.ok_or_else(|| {
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
-        unsafe { teardown_ta_page_table(platform, &shim, task_pt_id) };
+        teardown_ta_page_table(platform, task_pt_id);
         OpteeSmcReturnCode::EBadAddr
     })?;
     let ta_params = UserConstPtr::<Platform, UteeParams>::from_usize(params_address)
         .read_at_offset(0)
         .ok_or_else(|| {
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
-            unsafe { teardown_ta_page_table(platform, &shim, task_pt_id) };
+            teardown_ta_page_table(platform, task_pt_id);
             OpteeSmcReturnCode::EBadAddr
         })?;
 
@@ -977,10 +954,7 @@ fn open_session_new_instance(
             Some(ta_req_info),
             Some(&memref_addresses),
         );
-
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
-        unsafe { teardown_ta_page_table(platform, &shim, task_pt_id) };
+        teardown_ta_page_table(platform, task_pt_id);
 
         write_result?;
         return Ok(());
@@ -1000,9 +974,7 @@ fn open_session_new_instance(
         Some(&memref_addresses),
     )
     .inspect_err(|_| {
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
-        unsafe { teardown_ta_page_table(platform, &shim, task_pt_id) };
+        teardown_ta_page_table(platform, task_pt_id);
     })?;
 
     // Success: register the new session with the manager.
@@ -1150,12 +1122,7 @@ fn handle_invoke_command(
             }
 
             session_manager().unregister_session(session_id);
-
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
-            unsafe {
-                teardown_ta_page_table(platform, instance.shim(), task_pt_id);
-            };
+            teardown_ta_page_table(platform, task_pt_id);
 
             debug_serial_println!(
                 "InvokeCommand: cleaned up dead TA instance, task_pt_id={}",
@@ -1263,11 +1230,7 @@ fn handle_close_session(
                 let _ = session_manager()
                     .evict_cached_instance(instance);
             }
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
-            unsafe {
-                teardown_ta_page_table(platform, instance.shim(), task_pt_id);
-            };
+            teardown_ta_page_table(platform, task_pt_id);
 
             debug_serial_println!(
                 "CloseSession complete: deleted task_pt_id={} (last session)",
