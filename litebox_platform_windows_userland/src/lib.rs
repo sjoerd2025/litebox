@@ -107,6 +107,8 @@ unsafe extern "system" fn vectored_exception_handler(
         ".seh_endprologue",
         "fnstcw WORD PTR [rsp + 32]",
         "stmxcsr DWORD PTR [rsp + 36]",
+        // Clear the x87 FPU exception flags and restore the host x87 control word and mxcsr.
+        "fnclex",
         "fldcw WORD PTR [rip + {HOST_X87_CONTROL_WORD}]",
         "ldmxcsr DWORD PTR [rip + {HOST_MXCSR}]",
         "call {handler}",
@@ -935,7 +937,8 @@ syscall_callback:
     mov     r10, QWORD PTR [r11 + {GUEST_XSAVE_PTR}]
     xsave64 [r10]
     mov     BYTE PTR [r11 + {GUEST_XSTATE_FORMAT}], 0
-    // Restore the Windows ABI's standard host x87 control word and mxcsr.
+    // Clear the x87 FPU exception flags and restore the Windows ABI's standard host x87 control word and mxcsr.
+    fnclex
     fldcw WORD PTR [rip + {HOST_X87_CONTROL_WORD}]
     ldmxcsr DWORD PTR [rip + {HOST_MXCSR}]
 
@@ -950,7 +953,8 @@ syscall_callback:
     jmp .Ldone
 
 exception_callback:
-    // Restore the Windows ABI's standard host x87 control word and mxcsr.
+    // Clear the x87 FPU exception flags and restore the Windows ABI's standard host x87 control word and mxcsr.
+    fnclex
     fldcw WORD PTR [rip + {HOST_X87_CONTROL_WORD}]
     ldmxcsr DWORD PTR [rip + {HOST_MXCSR}]
     // Handle the exception. The stack and frame pointers are already restored,
@@ -964,7 +968,8 @@ interrupt_callback:
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     mov     rsp, [r11 + {HOST_SP}]
     mov     rbp, [r11 + {HOST_BP}]
-    // Restore the Windows ABI's standard host x87 control word and mxcsr.
+    // Clear the x87 FPU exception flags and restore the Windows ABI's standard host x87 control word and mxcsr.
+    fnclex
     fldcw WORD PTR [rip + {HOST_X87_CONTROL_WORD}]
     ldmxcsr DWORD PTR [rip + {HOST_MXCSR}]
     mov  rcx, QWORD PTR [rsp] // thread_ctx
@@ -2757,9 +2762,13 @@ mod tests {
         use litebox_common_linux::PtRegs;
         use std::cell::Cell;
 
-        const TEST_CW: u16 = 0x077f;
+        const TEST_CW: u16 = 0x077e;
         const TEST_MXCSR: u32 = 0x3f80;
         const TEST_VECTOR_QWORD: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+        const X87_STATUS_INVALID_OPERATION: u16 = 1 << 0;
+        const X87_STATUS_EXCEPTION_SUMMARY: u16 = 1 << 7;
+        const EXPECTED_X87_STATUS: u16 =
+            X87_STATUS_INVALID_OPERATION | X87_STATUS_EXCEPTION_SUMMARY;
 
         #[unsafe(naked)]
         unsafe extern "C" fn guest_entry() {
@@ -2774,6 +2783,10 @@ mod tests {
                 "mov QWORD PTR [rsp + 8], rax",
                 "mov QWORD PTR [rsp + 16], rax",
                 "mov QWORD PTR [rsp + 24], rax",
+                // Produce a divide-by-zero exception in the x87 FPU but mask it with the control word.
+                "fldz",
+                "fldz",
+                "fdivp st(1), st(0)",
                 "fldcw [rsp + 32]",
                 "ldmxcsr [rsp + 36]",
                 "movdqu xmm0, [rsp]",
@@ -2832,6 +2845,13 @@ mod tests {
                 let area = unsafe { &*(*crate::get_tls_ptr().unwrap()).guest_xsave_area.get() };
                 let legacy = area.legacy_state_for_context();
                 assert_eq!(legacy.ControlWord, TEST_CW);
+                assert_eq!(legacy.StatusWord & EXPECTED_X87_STATUS, EXPECTED_X87_STATUS);
+                let host_status: u16;
+                // SAFETY: FNSTSW reads the live x87 status without raising pending exceptions.
+                unsafe {
+                    core::arch::asm!("fnstsw ax", out("ax") host_status, options(nomem, nostack));
+                }
+                assert_eq!(host_status & 0xff, 0);
                 assert_eq!(legacy.MxCsr, TEST_MXCSR);
                 let expected = if call >= 4 { 0 } else { 0x5a };
                 assert_eq!(
