@@ -800,17 +800,16 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 impl<M: MemoryProvider, const ALIGN: usize> Drop for X64PageTable<'_, M, ALIGN> {
     /// Reclaims owned user frames and private page tables.
     ///
-    /// Active CR3s retain an `Arc`, released only after a non-PCID CR3 reload.
-    /// Thus final drop needs no shootdown. Only lower PML4 slots are private;
-    /// kernel slots are shared, and non-user leaf frames are externally owned.
-    /// Shared/COW user frames would require refcounting.
+    /// Active CR3s retain an `Arc`, released after a non-PCID CR3 reload, so
+    /// final drop needs no shootdown. Shared VTL1-kernel slots are skipped;
+    /// private page-table frames and exclusively owned user leaves are freed.
     #[allow(clippy::similar_names)]
     fn drop(&mut self) {
         let mut allocator = PageTableAllocator::<M>::new();
         let mut inner = self.inner.lock();
         let p4 = inner.level_4_table_mut();
 
-        // Kernel PML4 entries are shared.
+        // Skip shared VTL1-kernel PML4 entries.
         for (p4_index, p4_entry) in p4.iter_mut().enumerate().take(KERNEL_PML4_START) {
             let Ok(p3_frame) = p4_entry.frame() else {
                 p4_entry.set_unused();
@@ -849,7 +848,7 @@ impl<M: MemoryProvider, const ALIGN: usize> Drop for X64PageTable<'_, M, ALIGN> 
                     let p1 = unsafe { &mut *frame_to_pointer::<M>(p1_frame) };
 
                     for (p1_index, p1_entry) in p1.iter_mut().enumerate() {
-                        // Lower-half slots need no canonical sign extension.
+                        // Indices >= 256 cannot fall in the user range.
                         let page_address =
                             ((p4_index << 27) | (p3_index << 18) | (p2_index << 9) | p1_index)
                                 << 12;
@@ -872,17 +871,17 @@ impl<M: MemoryProvider, const ALIGN: usize> Drop for X64PageTable<'_, M, ALIGN> 
                     }
 
                     p2_entry.set_unused();
-                    // Safety: private lower-half P1 table.
+                    // Safety: private P1 table below the shared-slot cutoff.
                     unsafe { allocator.deallocate_frame(p1_frame) };
                 }
 
                 p3_entry.set_unused();
-                // Safety: private lower-half P2 table.
+                // Safety: private P2 table below the shared-slot cutoff.
                 unsafe { allocator.deallocate_frame(p2_frame) };
             }
 
             p4_entry.set_unused();
-            // Safety: private lower-half P3 table.
+            // Safety: private P3 table below the shared-slot cutoff.
             unsafe { allocator.deallocate_frame(p3_frame) };
         }
 
